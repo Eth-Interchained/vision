@@ -276,42 +276,42 @@ async fn send_batch(client: &Client, base: &str, db: &str, token: &str, ops: Vec
 // ---------------------------------------------------------------------------
 
 async fn stream_table(
-    label:        &str,
-    total:        usize,
-    start_offset: usize,
-    cli:          &Cli,
-    state_field:  &mut usize,
-    state:        &mut State,
-    fetch_chunk:  impl Fn(usize, usize) -> Result<Vec<Value>>,
-    client:       Arc<Client>,
-    pb:           &ProgressBar,
+    label:       &str,
+    total:       usize,
+    cli:         &Cli,
+    state:       &mut State,
+    get_done:    fn(&State) -> usize,
+    set_done:    fn(&mut State, usize),
+    fetch_chunk: impl Fn(usize, usize) -> Result<Vec<Value>>,
+    client:      Arc<Client>,
+    pb:          &ProgressBar,
 ) -> Result<usize> {
-    let mut offset  = start_offset;
-    let mut sent    = 0usize;
+    let start  = get_done(state);
+    let mut offset = start;
+    let mut sent   = 0usize;
 
     while offset < total {
-        // 1. Fetch one chunk from SQLite (low memory — only `chunk` rows at a time)
+        // 1. Fetch one chunk from SQLite — only `chunk` rows in memory at once
         let ops = fetch_chunk(offset, cli.chunk)?;
         if ops.is_empty() {
-            break; // expired/filtered rows mean chunk may be empty — advance
+            // All remaining rows were filtered (expired / skip-block-cache)
+            offset += cli.chunk;
+            continue;
         }
-
         let chunk_len = ops.len();
 
-        // 2. Split chunk into batches and send concurrently
+        // 2. Split into batches and fire concurrently
         let sem = Arc::new(Semaphore::new(cli.concurrency));
         let mut handles = Vec::new();
-
         for batch in ops.chunks(cli.batch_size) {
-            let batch_ops  = batch.to_vec();
-            let batch_len  = batch_ops.len();
-            let c2         = Arc::clone(&client);
-            let sem2       = Arc::clone(&sem);
-            let base       = cli.nedb_url.clone();
-            let db         = cli.db.clone();
-            let tok        = cli.token.clone();
-            let dry        = cli.dry_run;
-
+            let batch_ops = batch.to_vec();
+            let batch_len = batch_ops.len();
+            let c2        = Arc::clone(&client);
+            let sem2      = Arc::clone(&sem);
+            let base      = cli.nedb_url.clone();
+            let db        = cli.db.clone();
+            let tok       = cli.token.clone();
+            let dry       = cli.dry_run;
             let h: tokio::task::JoinHandle<Result<usize>> = tokio::spawn(async move {
                 let _p = sem2.acquire_owned().await.unwrap();
                 if dry { return Ok(batch_len); }
@@ -320,28 +320,27 @@ async fn stream_table(
             handles.push((h, batch_len));
         }
 
-        // 3. Collect results in order
+        // 3. Collect in order
         let mut chunk_sent = 0usize;
         for (h, batch_len) in handles {
             chunk_sent += h.await.context("task panicked")??;
             pb.inc(batch_len as u64);
         }
 
-        sent    += chunk_sent;
-        offset  += chunk_len;       // advance by raw chunk size (pre-filter)
+        sent   += chunk_sent;
+        offset += chunk_len;
 
-        // 4. Persist cursor after every chunk — losing a chunk is the worst case
-        *state_field = offset;
+        // 4. Save cursor atomically after every chunk
+        set_done(state, offset);
         if !cli.dry_run {
             save_state(&cli.state_file, state)?;
         }
-
         if cli.verbose {
-            eprintln!("  {label}: offset={offset}/{total} sent_this_chunk={chunk_sent}");
+            eprintln!("  {label}: {offset}/{total}  chunk_sent={chunk_sent}");
         }
     }
 
-    pb.finish_with_message(format!("{} rows", start_offset + sent));
+    pb.finish_with_message(format!("{} rows", start + sent));
     Ok(sent)
 }
 
@@ -499,13 +498,12 @@ async fn main() -> Result<()> {
     {
         let skip = cli.skip_block_cache;
         let c    = Arc::clone(&client);
-        let kv_sent = stream_table(
-            "kv", kv_total, kv_start, &cli,
-            &mut state.kv_done, &mut state,
+        stream_table(
+            "kv", kv_total, &cli, &mut state,
+            |s| s.kv_done, |s, v| s.kv_done = v,
             |off, lim| fetch_kv_chunk(&conn, off, lim, skip),
             c, &pb_kv,
         ).await?;
-        let _ = kv_sent; // progress bar handles display
     }
 
     // ── zsets ────────────────────────────────────────────────────────────────
@@ -513,8 +511,8 @@ async fn main() -> Result<()> {
     {
         let c = Arc::clone(&client);
         stream_table(
-            "zset", zsets_total, zsets_start, &cli,
-            &mut state.zsets_done, &mut state,
+            "zset", zsets_total, &cli, &mut state,
+            |s| s.zsets_done, |s, v| s.zsets_done = v,
             |off, lim| fetch_zset_chunk(&conn, off, lim),
             c, &pb_zset,
         ).await?;
@@ -525,8 +523,8 @@ async fn main() -> Result<()> {
     {
         let c = Arc::clone(&client);
         stream_table(
-            "set", sets_total, sets_start, &cli,
-            &mut state.sets_done, &mut state,
+            "set", sets_total, &cli, &mut state,
+            |s| s.sets_done, |s, v| s.sets_done = v,
             |off, lim| fetch_set_chunk(&conn, off, lim),
             c, &pb_set,
         ).await?;
