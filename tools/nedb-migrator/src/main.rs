@@ -52,12 +52,14 @@ struct Cli {
     #[arg(long, default_value_t = 2000)]
     chunk: usize,
 
-    /// Concurrent nedbd batch requests per chunk
-    #[arg(long, default_value_t = 16)]
+    /// Concurrent nedbd batch requests per chunk.
+    /// Reduce to 2-4 for encrypted databases — nedbd's Sequencer serialises
+    /// writes and high concurrency causes queue buildup + timeouts.
+    #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
     /// Rows per nedbd batch request
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     batch_size: usize,
 
     /// Skip vision:block:height:* and vision:block:hash:* kv rows
@@ -243,13 +245,30 @@ async fn ensure_db(client: &Client, base: &str, db: &str, token: &str) -> Result
 }
 
 async fn send_batch(client: &Client, base: &str, db: &str, token: &str, ops: Vec<Value>) -> Result<usize> {
-    let resp = client.post(format!("{base}/v1/databases/{db}/batch"))
-        .maybe_bearer(token)
-        .json(&json!({"ops": ops}))
-        .send().await?
-        .error_for_status()?;
-    let body: Value = resp.json().await?;
-    Ok(body["count"].as_u64().unwrap_or(0) as usize)
+    // Retry up to 4 times with exponential backoff.
+    // Encrypted nedbd under write pressure can timeout transiently — this
+    // ensures a single slow Sequencer flush doesn't abort the migration.
+    let mut delay_ms = 500u64;
+    let mut last_err = String::new();
+    for attempt in 1u8..=4 {
+        match client.post(format!("{base}/v1/databases/{db}/batch"))
+            .maybe_bearer(token)
+            .json(&json!({"ops": &ops}))
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                let body: Value = r.json().await?;
+                return Ok(body["count"].as_u64().unwrap_or(0) as usize);
+            }
+            Ok(r) => last_err = format!("HTTP {}", r.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 2).min(8_000);
+        }
+    }
+    anyhow::bail!("batch failed after 4 attempts: {last_err}")
 }
 
 // ---------------------------------------------------------------------------
