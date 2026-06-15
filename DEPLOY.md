@@ -146,3 +146,86 @@ docker compose up -d --build   # or repeat the bare-metal step 2
 ```
 
 Database is preserved. The address index resumes where it left off.
+
+---
+
+## 7. NEDB integration (optional — enables time-travel + NQL showcase)
+
+Vision can use [nedb-engine](https://github.com/Eth-Interchained/nedb) as its
+primary KV store and as a rich query layer over token operations, block headers,
+and reward splits.
+
+### 7.1 Start nedbd
+
+```bash
+pip install nedb-engine
+nedbd                              # HTTP on :7070, data in ./nedb-data
+# With encryption:
+NEDB_TMK=<32-byte-hex> nedbd
+```
+
+### 7.2 Enable in Vision
+
+Add to your `.env`:
+
+```env
+NEDB_URL=http://127.0.0.1:7070
+NEDB_DB_NAME=vision
+NEDBD_TOKEN=                       # leave blank unless you set --token on nedbd
+```
+
+Restart Vision. The `/api/nedb/*` routes and the `/nedb` showcase page are now live.
+
+### 7.3 Migrate existing SQLite state (one-time)
+
+```bash
+cd backend
+python scripts/migrate_sqlite_to_nedb.py \
+    --sqlite ../data/vision.db \
+    --nedb-url http://127.0.0.1:7070 \
+    --db vision
+```
+
+### 7.4 Start the ITSL mirror daemon
+
+The mirror daemon populates three collections that power the `/nedb` page:
+`itsl_ops` (token operations with causal links), `blocks` (block headers),
+and `reward_splits` (per-block coinbase splits).
+
+```bash
+cp itsl_mirror.env.example itsl_mirror.env
+$EDITOR itsl_mirror.env     # fill in RPC + nedbd credentials
+
+# One-off sync (test first):
+python backend/scripts/itsl_mirror.py --once
+
+# Daemon mode (keep running in the background):
+python backend/scripts/itsl_mirror.py --interval 30
+
+# systemd (production):
+sudo cp itsl_mirror.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now itsl_mirror
+sudo journalctl -u itsl_mirror -f
+```
+
+### 7.5 NQL queries unlocked after mirror runs
+
+```nql
+-- Full token operation history with causal chain
+FROM itsl_ops WHERE token = "0x...tok" TRACE caused_by
+
+-- Time-travel: what were token balances at block 50000?
+FROM itsl_ops WHERE token = "0x...tok" AS OF 50000
+
+-- Bi-temporal: operations valid on a specific date
+FROM itsl_ops VALID AS OF "2026-01-01" WHERE token = "0x...tok"
+
+-- Governance treasury inflow this month
+FROM reward_splits WHERE timestamp >= 1748736000 GROUP BY governance_address SUM governance_reward
+
+-- Chain tip at any point in history
+FROM blocks ORDER BY height DESC LIMIT 1 AS OF <seq>
+```
+
+Visit `/nedb` in the Vision UI to run these interactively.

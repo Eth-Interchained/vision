@@ -1,0 +1,40 @@
+[Unit]
+Description=ITSL → NEDB Mirror Daemon
+Documentation=https://github.com/Eth-Interchained/vision
+After=network.target interchainedd.service nedbd.service
+Wants=nedbd.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/vision/backend
+
+# ── Runtime configuration ──────────────────────────────────────────────────
+# Copy /opt/vision/itsl_mirror.env.example to /opt/vision/itsl_mirror.env
+# and fill in the values before starting the service.
+EnvironmentFile=/opt/vision/itsl_mirror.env
+
+ExecStart=/usr/bin/python3 scripts/itsl_mirror.py \
+    --rpc-url   ${ITC_RPC_URL} \
+    --rpc-user  ${ITC_RPC_USER} \
+    --rpc-pass  ${ITC_RPC_PASS} \
+    --wallet    ${ITC_WALLET_NAME} \
+    --nedb-url  ${NEDB_URL} \
+    --nedb-token ${NEDBD_TOKEN} \
+    --db        ${NEDB_DB_NAME} \
+    --interval  ${MIRROR_INTERVAL:-30}
+
+# Graceful shutdown: wait up to 30s for the current pass to finish
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+Restart=on-failure
+RestartSec=15s
+
+# ── Logging ────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=itsl_mirror
+
+[Install]
+WantedBy=multi-user.target
