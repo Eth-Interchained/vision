@@ -196,3 +196,13 @@ async def nedb_verify() -> dict:
         "head": result.get("head"),
         "tamper_evident": True,
     }
+
+
+@router.get("/nedb/backfill-status")
+async def nedb_backfill_status() -> dict:
+    """Return the current state of the bi-directional block backfill task."""
+    from ..indexer.nedb_backfill import get_backfill_task
+    task = get_backfill_task()
+    if task is None:
+        return {"active": False, "reason": "NEDB_URL not configured or backfill not started"}
+    return {"active": True, **task.status()}

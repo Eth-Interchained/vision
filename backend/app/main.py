@@ -15,13 +15,10 @@ from .indexer.main_loop import get_indexer
 from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
-from . import nedb_store
-from .dual_store import DualStore
-from .sqlite_store import (
-    close_address_index_writer, close_db,
-    init_address_index_writer, init_db,
-    get_db as _get_sqlite_db,
-    set_store_override,
+from .sqlite_store import close_address_index_writer, close_db, init_address_index_writer, init_db
+from .indexer.nedb_backfill import (
+    NedbBackfillTask, SqliteBlockSource, RpcBlockSource,
+    get_backfill_task, set_backfill_task,
 )
 from .routes import (
     addresses,
@@ -73,23 +70,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("init_db failed at startup: %s", e, exc_info=True)
         raise
-
-    # Dual-write store: when NEDB_URL is set, all writes flow to both SQLite
-    # and nedbd simultaneously. Reads prefer nedbd (sticky) and fall back to
-    # SQLite. On nedbd failure, Vision degrades transparently to SQLite-only.
-    if settings.NEDB_URL:
-        try:
-            await nedb_store.init_db()
-            dual = DualStore(_get_sqlite_db(), nedb_store.get_db())
-            set_store_override(dual)
-            logger.info(
-                "DualStore active — writes to SQLite + nedbd, reads prefer nedbd "
-                "(url=%s, db=%s)", settings.NEDB_URL, settings.NEDB_DB_NAME
-            )
-        except Exception as e:
-            logger.warning(
-                "DualStore init failed (non-fatal — SQLite remains primary): %s", e
-            )
 
     indexer = get_indexer()
     address_indexer = get_address_indexer()
@@ -163,23 +143,47 @@ async def lifespan(app: FastAPI):
 
     _background_tasks.append(asyncio.create_task(webhooks.webhook_dispatcher_loop()))
 
+    # ── NEDB bi-directional backfill (tip → genesis) ──────────────────────
+    # Runs only when NEDB_URL is configured. Uses SQLite cache as primary
+    # source (fast, no RPC), falls back to live RPC for missing blocks.
+    if settings.NEDB_URL:
+        try:
+            from .sqlite_store import get_db as _get_db
+            from .rpc.client import get_rpc as _get_rpc
+            _backfill = NedbBackfillTask(
+                nedb=nedb_store.get_db(),
+                db=settings.NEDB_DB_NAME,
+                sources=[
+                    SqliteBlockSource(_get_db()),
+                    RpcBlockSource(_get_rpc()),
+                ],
+                batch_size=50,
+                sleep_ms=200,
+                collection="blocks",
+            )
+            set_backfill_task(_backfill)
+            await _backfill.start()
+            logger.info("NedbBackfillTask started (tip→genesis + forward sync)")
+        except Exception as e:
+            logger.warning("NedbBackfillTask failed to start (non-fatal): %s", e)
+
     yield
 
     logger.info("Vision backend stopping")
     for t in _background_tasks:
         t.cancel()
+
+    # Stop backfill gracefully
+    _bt = get_backfill_task()
+    if _bt:
+        await _bt.stop()
+
     await indexer.stop()
     await address_indexer.stop()
     await close_address_index_writer()
     await close_electrumx()
     await close_rpc()
     await close_db()
-    if settings.NEDB_URL:
-        set_store_override(None)   # restore SQLiteStore as get_db() default
-        try:
-            await nedb_store.close_db()
-        except Exception as e:
-            logger.warning("nedb_store.close_db failed: %s", e)
 
 
 app = FastAPI(
