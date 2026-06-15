@@ -107,14 +107,16 @@ class DualStore:
                     self._nedb_online = False
                     logger.warning(
                         "DualStore: nedbd write failed — running SQLite-only "
-                        "until nedbd recovers. Error: %s", e
+                        "until nedbd recovers. %s: %s",
+                        type(e).__name__, e or "(no message)"
                     )
                     self._last_offline_log = now
                 elif now - self._last_offline_log >= _OFFLINE_WARN_INTERVAL:
                     logger.warning(
                         "DualStore: nedbd still unavailable "
-                        "(failures=%d, successes=%d). Error: %s",
-                        self._write_failures, self._write_successes, e,
+                        "(failures=%d, successes=%d). %s: %s",
+                        self._write_failures, self._write_successes,
+                        type(e).__name__, e or "(no message)",
                     )
                     self._last_offline_log = now
 
