@@ -192,7 +192,7 @@ fn read_kv(conn: &Connection, skip_block_cache: bool) -> Result<Vec<KvRow>> {
 fn read_zsets(conn: &Connection) -> Result<Vec<ZsetRow>> {
     let mut stmt =
         conn.prepare("SELECT name, member, score FROM zsets ORDER BY rowid")?;
-    Ok(stmt
+    let rows: Vec<ZsetRow> = stmt
         .query_map([], |r| {
             Ok(ZsetRow {
                 name:   r.get(0)?,
@@ -201,12 +201,13 @@ fn read_zsets(conn: &Connection) -> Result<Vec<ZsetRow>> {
             })
         })?
         .filter_map(|r| r.ok())
-        .collect())
+        .collect();
+    Ok(rows)
 }
 
 fn read_sets(conn: &Connection) -> Result<Vec<SetRow>> {
     let mut stmt = conn.prepare("SELECT name, member FROM sets ORDER BY rowid")?;
-    Ok(stmt
+    let rows: Vec<SetRow> = stmt
         .query_map([], |r| {
             Ok(SetRow {
                 name:   r.get(0)?,
@@ -214,7 +215,8 @@ fn read_sets(conn: &Connection) -> Result<Vec<SetRow>> {
             })
         })?
         .filter_map(|r| r.ok())
-        .collect())
+        .collect();
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
