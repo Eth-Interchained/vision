@@ -89,6 +89,10 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Skip the nedbd verification pass at startup (use state file as-is)
+    #[arg(long)]
+    no_verify: bool,
+
     /// Verbose: print each batch
     #[arg(long, short)]
     verbose: bool,
@@ -293,6 +297,111 @@ async fn send_batch_http(
     Ok(body["count"].as_u64().unwrap_or(0) as usize)
 }
 
+/// Query how many documents a collection currently holds in nedbd.
+/// Uses a high LIMIT — nedbd returns `count` in the response.
+async fn count_collection(
+    client: &Client,
+    base:   &str,
+    db:     &str,
+    token:  &str,
+    coll:   &str,
+) -> Result<usize> {
+    let resp = client
+        .post(format!("{}/v1/databases/{}/query", base, db))
+        .maybe_bearer(token)
+        .json(&json!({ "nql": format!("FROM {} LIMIT 1", coll) }))
+        .send()
+        .await;
+
+    // If the database or collection doesn't exist yet, treat count as 0.
+    match resp {
+        Err(_) => Ok(0),
+        Ok(r) => {
+            if !r.status().is_success() {
+                return Ok(0);
+            }
+            // Re-run with no limit to get actual count
+            let body: Value = r.json().await?;
+            // First check "count" field — nedbd returns it
+            if let Some(c) = body["count"].as_u64() {
+                if c < 2 {
+                    // Could be 0 or 1 — do a full count
+                    let r2 = client
+                        .post(format!("{}/v1/databases/{}/query", base, db))
+                        .maybe_bearer(token)
+                        .json(&json!({ "nql": format!("FROM {} LIMIT 9999999", coll) }))
+                        .send()
+                        .await?;
+                    let b2: Value = r2.json().await?;
+                    return Ok(b2["count"].as_u64().unwrap_or(0) as usize);
+                }
+                return Ok(c as usize);
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Check nedbd collection counts and advance the resume state if nedbd is
+/// ahead of the state file (e.g. data inserted by the Python migrator or a
+/// previous run on another machine).
+async fn verify_against_nedb(
+    client:      &Client,
+    base:        &str,
+    db:          &str,
+    token:       &str,
+    state:       &mut State,
+    kv_total:    usize,
+    zsets_total: usize,
+    sets_total:  usize,
+    state_file:  &Path,
+) -> Result<()> {
+    print!("{} Verifying against nedbd…  ", "◉".blue());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    let kv_n    = count_collection(client, base, db, token, "kv").await.unwrap_or(0);
+    let zset_n  = count_collection(client, base, db, token, "zset").await.unwrap_or(0);
+    let set_n   = count_collection(client, base, db, token, "set").await.unwrap_or(0);
+
+    println!("kv={kv_n} zset={zset_n} set={set_n}");
+
+    let mut advanced = false;
+
+    macro_rules! sync_field {
+        ($field:expr, $nedb_count:expr, $total:expr, $label:expr) => {
+            if $nedb_count > $field && $nedb_count <= $total {
+                println!(
+                    "  {} {}: state file={} → nedbd={} (advancing)",
+                    "↑".yellow(), $label, $field, $nedb_count
+                );
+                $field = $nedb_count;
+                advanced = true;
+            } else if $nedb_count >= $total && $field < $total {
+                // nedbd already has all rows for this table
+                println!(
+                    "  {} {}: nedbd has all {} rows — skipping table",
+                    "✓".green(), $label, $total
+                );
+                $field = $total;
+                advanced = true;
+            }
+        };
+    }
+
+    sync_field!(state.kv_done,    kv_n,   kv_total,    "kv");
+    sync_field!(state.zsets_done, zset_n, zsets_total, "zsets");
+    sync_field!(state.sets_done,  set_n,  sets_total,  "sets");
+
+    if advanced {
+        save_state(state_file, state)?;
+        println!("  {} State synced from nedbd.\n", "✓".green());
+    } else {
+        println!("  {} State is consistent with nedbd.\n", "✓".green());
+    }
+
+    Ok(())
+}
+
 /// Trait for optional bearer auth — keeps call sites clean.
 trait MaybeBearer {
     fn maybe_bearer(self, token: &str) -> Self;
@@ -451,6 +560,24 @@ async fn main() -> Result<()> {
             h["encrypted"].as_bool().unwrap_or(false)
         );
         ensure_db(&probe, &cli.nedb_url, &cli.db, &cli.token).await?;
+
+        // ── Verify state against what nedbd actually holds ────────────────
+        if !cli.no_verify {
+            verify_against_nedb(
+                &probe,
+                &cli.nedb_url,
+                &cli.db,
+                &cli.token,
+                &mut state,
+                kv_rows.len(),
+                zset_rows.len(),
+                set_rows.len(),
+                &cli.state_file,
+            )
+            .await?;
+        } else {
+            println!("{} Skipping nedbd verification (--no-verify)\n", "⚠".yellow());
+        }
     } else {
         println!("{} Dry-run — skipping nedbd check\n", "⚠".yellow());
     }
