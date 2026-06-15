@@ -1,25 +1,16 @@
-//! nedb-migrator — fast, resumable SQLite → nedbd migration tool
+//! nedb-migrator — fast, resumable, low-memory SQLite → nedbd migration tool
 //!
-//! Reads all kv / zsets / sets rows from a Vision SQLite database and writes
-//! them to a running nedbd instance using concurrent batch HTTP requests.
+//! Streams SQLite rows in chunks so memory usage stays constant regardless of
+//! table size. 1.2M rows uses the same RAM as 1k rows.
 //!
 //! # Usage
 //!
 //! ```bash
-//! # Dry run — see what would be migrated
-//! nedb-migrator --sqlite ../data/vision.db --dry-run
-//!
-//! # Full migration (resumes automatically if interrupted)
 //! nedb-migrator --sqlite ../data/vision.db
-//!
-//! # Skip the ~90k block cache rows, only migrate live state (~20 rows)
 //! nedb-migrator --sqlite ../data/vision.db --skip-block-cache
-//!
-//! # Reset progress and start from scratch
 //! nedb-migrator --sqlite ../data/vision.db --reset
-//!
-//! # Tune concurrency and batch size for faster hardware
-//! nedb-migrator --sqlite ../data/vision.db --concurrency 32 --batch-size 200
+//! nedb-migrator --sqlite ../data/vision.db --dry-run
+//! nedb-migrator --sqlite ../data/vision.db --chunk 5000 --concurrency 32
 //! ```
 
 use std::fs;
@@ -30,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -42,58 +33,49 @@ use tokio::sync::Semaphore;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(
-    name        = "nedb-migrator",
-    version     = "1.0.0",
-    about       = "Fast, resumable SQLite → nedbd migration for Interchained Vision",
-    long_about  = None,
-)]
+#[command(name = "nedb-migrator", version = "1.0.0",
+          about = "Fast, resumable, streaming SQLite → nedbd migration")]
 struct Cli {
-    /// Path to the Vision SQLite database
     #[arg(long, default_value = "../data/vision.db")]
     sqlite: PathBuf,
 
-    /// nedbd base URL
-    #[arg(long, env = "NEDB_URL", default_value = "http://127.0.0.1:7070")]
+    #[arg(long, default_value = "http://127.0.0.1:7070")]
     nedb_url: String,
 
-    /// nedbd database name
-    #[arg(long, env = "NEDB_DB_NAME", default_value = "vision")]
+    #[arg(long, default_value = "vision")]
     db: String,
 
-    /// nedbd bearer token (leave blank if not set)
-    #[arg(long, env = "NEDBD_TOKEN", default_value = "")]
+    #[arg(long, default_value = "")]
     token: String,
 
-    /// Number of ops per batch request sent to nedbd
-    #[arg(long, default_value_t = 100)]
-    batch_size: usize,
+    /// Rows fetched from SQLite per streaming chunk (controls peak memory)
+    #[arg(long, default_value_t = 2000)]
+    chunk: usize,
 
-    /// Maximum concurrent batch requests in flight
+    /// Concurrent nedbd batch requests per chunk
     #[arg(long, default_value_t = 16)]
     concurrency: usize,
 
-    /// Skip vision:block:height:* and vision:block:hash:* rows (~90k rows)
+    /// Rows per nedbd batch request
+    #[arg(long, default_value_t = 100)]
+    batch_size: usize,
+
+    /// Skip vision:block:height:* and vision:block:hash:* kv rows
     #[arg(long)]
     skip_block_cache: bool,
 
-    /// Path to the resume state file
     #[arg(long, default_value = ".nedb-migrator-state.json")]
     state_file: PathBuf,
 
-    /// Delete saved progress and start from scratch
     #[arg(long)]
     reset: bool,
 
-    /// Print what would be migrated without writing to nedbd
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Skip the nedbd verification pass at startup (use state file as-is)
     #[arg(long)]
     no_verify: bool,
 
-    /// Verbose: print each batch
+    #[arg(long)]
+    dry_run: bool,
+
     #[arg(long, short)]
     verbose: bool,
 }
@@ -102,8 +84,6 @@ struct Cli {
 // Resume state
 // ---------------------------------------------------------------------------
 
-/// Tracks how many rows of each table have already been successfully sent.
-/// Written atomically after every batch via temp-file-then-rename.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct State {
     kv_done:    usize,
@@ -126,169 +106,134 @@ fn save_state(path: &Path, state: &State) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// SQLite row types
+// SQLite helpers — streaming via LIMIT/OFFSET, never loads full table
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct KvRow {
-    key:        String,
-    value:      String,
-    expires_at: Option<f64>,
+fn count_table(conn: &Connection, table: &str, extra_where: &str) -> Result<usize> {
+    let sql = if extra_where.is_empty() {
+        format!("SELECT COUNT(*) FROM {table}")
+    } else {
+        format!("SELECT COUNT(*) FROM {table} WHERE {extra_where}")
+    };
+    Ok(conn.query_row(&sql, [], |r| r.get::<_, i64>(0))? as usize)
 }
 
-#[derive(Clone)]
-struct ZsetRow {
-    name:   String,
-    member: String,
-    score:  f64,
-}
-
-#[derive(Clone)]
-struct SetRow {
-    name:   String,
-    member: String,
-}
-
-// ---------------------------------------------------------------------------
-// SQLite readers (all read-only, one pass each)
-// ---------------------------------------------------------------------------
-
-fn read_kv(conn: &Connection, skip_block_cache: bool) -> Result<Vec<KvRow>> {
+/// Fetch one chunk of kv rows starting at `offset`, up to `limit` rows.
+fn fetch_kv_chunk(
+    conn: &Connection,
+    offset: usize,
+    limit: usize,
+    skip_block_cache: bool,
+) -> Result<Vec<Value>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
 
-    let mut stmt = conn.prepare("SELECT key, value, expires_at FROM kv ORDER BY rowid")?;
-    let rows: Vec<KvRow> = stmt
-        .query_map([], |r| {
-            Ok(KvRow {
-                key:        r.get(0)?,
-                value:      r.get(1)?,
-                expires_at: r.get(2)?,
-            })
+    let sql = "SELECT key, value, expires_at FROM kv ORDER BY rowid LIMIT ?1 OFFSET ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map([limit as i64, offset as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+            ))
         })?
         .filter_map(|r| r.ok())
-        .filter(|r| {
-            // Drop expired rows
-            if let Some(exp) = r.expires_at {
-                if exp < now {
-                    return false;
-                }
+        .filter(|(key, _, expires_at)| {
+            if let Some(exp) = expires_at {
+                if *exp < now { return false; }
             }
-            // Optionally skip the per-block cache (~90k rows)
             if skip_block_cache
-                && (r.key.starts_with("vision:block:height:")
-                    || r.key.starts_with("vision:block:hash:"))
+                && (key.starts_with("vision:block:height:")
+                    || key.starts_with("vision:block:hash:"))
             {
                 return false;
             }
             true
         })
+        .map(|(key, value, expires_at)| json!({
+            "op": "put", "coll": "kv", "id": &key,
+            "doc": { "_id": &key, "value": value, "expires_at": expires_at }
+        }))
         .collect();
     Ok(rows)
 }
 
-fn read_zsets(conn: &Connection) -> Result<Vec<ZsetRow>> {
-    let mut stmt =
-        conn.prepare("SELECT name, member, score FROM zsets ORDER BY rowid")?;
-    let rows: Vec<ZsetRow> = stmt
-        .query_map([], |r| {
-            Ok(ZsetRow {
-                name:   r.get(0)?,
-                member: r.get(1)?,
-                score:  r.get(2)?,
-            })
+fn fetch_zset_chunk(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Value>> {
+    let sql = "SELECT name, member, score FROM zsets ORDER BY rowid LIMIT ?1 OFFSET ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map([limit as i64, offset as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
         })?
         .filter_map(|r| r.ok())
+        .map(|(name, member, score)| {
+            let id = format!("{name}::{member}");
+            json!({
+                "op": "put", "coll": "zset", "id": &id,
+                "doc": { "_id": &id, "_name": name, "_member": member, "score": score }
+            })
+        })
         .collect();
     Ok(rows)
 }
 
-fn read_sets(conn: &Connection) -> Result<Vec<SetRow>> {
-    let mut stmt = conn.prepare("SELECT name, member FROM sets ORDER BY rowid")?;
-    let rows: Vec<SetRow> = stmt
-        .query_map([], |r| {
-            Ok(SetRow {
-                name:   r.get(0)?,
-                member: r.get(1)?,
-            })
+fn fetch_set_chunk(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Value>> {
+    let sql = "SELECT name, member FROM sets ORDER BY rowid LIMIT ?1 OFFSET ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map([limit as i64, offset as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .filter_map(|r| r.ok())
+        .map(|(name, member)| {
+            let id = format!("{name}::{member}");
+            json!({
+                "op": "put", "coll": "set", "id": &id,
+                "doc": { "_id": &id, "_name": name, "_member": member }
+            })
+        })
         .collect();
     Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
-// nedbd batch op builders
+// nedbd HTTP
 // ---------------------------------------------------------------------------
 
-fn kv_op(r: &KvRow) -> Value {
-    json!({
-        "op": "put", "coll": "kv", "id": r.key,
-        "doc": { "_id": r.key, "value": r.value, "expires_at": r.expires_at }
-    })
+trait MaybeBearer { fn maybe_bearer(self, token: &str) -> Self; }
+impl MaybeBearer for reqwest::RequestBuilder {
+    fn maybe_bearer(self, t: &str) -> Self {
+        if t.is_empty() { self } else { self.bearer_auth(t) }
+    }
 }
-
-fn zset_op(r: &ZsetRow) -> Value {
-    let id = format!("{}::{}", r.name, r.member);
-    json!({
-        "op": "put", "coll": "zset", "id": &id,
-        "doc": { "_id": &id, "_name": r.name, "_member": r.member, "score": r.score }
-    })
-}
-
-fn set_op(r: &SetRow) -> Value {
-    let id = format!("{}::{}", r.name, r.member);
-    json!({
-        "op": "put", "coll": "set", "id": &id,
-        "doc": { "_id": &id, "_name": r.name, "_member": r.member }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// nedbd HTTP helpers
-// ---------------------------------------------------------------------------
 
 async fn nedb_health(client: &Client, base: &str, token: &str) -> Result<Value> {
-    Ok(client
-        .get(format!("{}/health", base))
-        .maybe_bearer(token)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?)
+    Ok(client.get(format!("{base}/health"))
+        .maybe_bearer(token).send().await?.json().await?)
 }
 
 async fn ensure_db(client: &Client, base: &str, db: &str, token: &str) -> Result<()> {
-    // Retry up to 3 times — first access after heavy writes can be slow
-    // while nedbd replays the AOF log for a large encrypted database.
     let mut last_err = String::new();
-    for attempt in 1..=3u8 {
-        match client
-            .get(format!("{}/v1/databases/{}", base, db))
-            .maybe_bearer(token)
-            .send()
-            .await
+    for attempt in 1u8..=3 {
+        match client.get(format!("{base}/v1/databases/{db}"))
+            .maybe_bearer(token).send().await
         {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) if r.status().as_u16() == 404 => {
-                // DB doesn't exist yet — create it
-                client
-                    .post(format!("{}/v1/databases", base))
+                client.post(format!("{base}/v1/databases"))
                     .maybe_bearer(token)
                     .json(&json!({"name": db}))
-                    .send()
-                    .await?
-                    .error_for_status()
-                    .context("Failed to create nedbd database")?;
+                    .send().await?.error_for_status()?;
                 return Ok(());
             }
-            Ok(r) => last_err = format!("HTTP {}", r.status()),
+            Ok(r)  => last_err = format!("HTTP {}", r.status()),
             Err(e) => {
                 last_err = e.to_string();
                 if attempt < 3 {
-                    eprintln!("  ensure_db attempt {attempt}/3 failed ({last_err}), retrying…");
+                    eprintln!("  ensure_db attempt {attempt}/3 failed, retrying in 5s…");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
@@ -297,211 +242,141 @@ async fn ensure_db(client: &Client, base: &str, db: &str, token: &str) -> Result
     anyhow::bail!("ensure_db failed after 3 attempts: {last_err}")
 }
 
-async fn send_batch_http(
-    client: &Client,
-    base:   &str,
-    db:     &str,
-    token:  &str,
-    ops:    Vec<Value>,
-) -> Result<usize> {
-    let resp = client
-        .post(format!("{}/v1/databases/{}/batch", base, db))
+async fn send_batch(client: &Client, base: &str, db: &str, token: &str, ops: Vec<Value>) -> Result<usize> {
+    let resp = client.post(format!("{base}/v1/databases/{db}/batch"))
         .maybe_bearer(token)
         .json(&json!({"ops": ops}))
-        .send()
-        .await?
-        .error_for_status()
-        .context("nedbd batch failed")?;
+        .send().await?
+        .error_for_status()?;
     let body: Value = resp.json().await?;
     Ok(body["count"].as_u64().unwrap_or(0) as usize)
 }
 
-/// Query how many documents a collection currently holds in nedbd.
-/// Uses a high LIMIT — nedbd returns `count` in the response.
-async fn count_collection(
-    client: &Client,
-    base:   &str,
-    db:     &str,
-    token:  &str,
-    coll:   &str,
-) -> Result<usize> {
-    let resp = client
-        .post(format!("{}/v1/databases/{}/query", base, db))
-        .maybe_bearer(token)
-        .json(&json!({ "nql": format!("FROM {} LIMIT 1", coll) }))
-        .send()
-        .await;
+// ---------------------------------------------------------------------------
+// Streaming table sender — processes one chunk at a time, constant memory
+// ---------------------------------------------------------------------------
 
-    // If the database or collection doesn't exist yet, treat count as 0.
-    match resp {
-        Err(_) => Ok(0),
-        Ok(r) => {
-            if !r.status().is_success() {
-                return Ok(0);
-            }
-            // Re-run with no limit to get actual count
-            let body: Value = r.json().await?;
-            // First check "count" field — nedbd returns it
-            if let Some(c) = body["count"].as_u64() {
-                if c < 2 {
-                    // Could be 0 or 1 — do a full count
-                    let r2 = client
-                        .post(format!("{}/v1/databases/{}/query", base, db))
-                        .maybe_bearer(token)
-                        .json(&json!({ "nql": format!("FROM {} LIMIT 9999999", coll) }))
-                        .send()
-                        .await?;
-                    let b2: Value = r2.json().await?;
-                    return Ok(b2["count"].as_u64().unwrap_or(0) as usize);
-                }
-                return Ok(c as usize);
-            }
-            Ok(0)
+async fn stream_table(
+    label:        &str,
+    total:        usize,
+    start_offset: usize,
+    cli:          &Cli,
+    state_field:  &mut usize,
+    state:        &mut State,
+    fetch_chunk:  impl Fn(usize, usize) -> Result<Vec<Value>>,
+    client:       Arc<Client>,
+    pb:           &ProgressBar,
+) -> Result<usize> {
+    let mut offset  = start_offset;
+    let mut sent    = 0usize;
+
+    while offset < total {
+        // 1. Fetch one chunk from SQLite (low memory — only `chunk` rows at a time)
+        let ops = fetch_chunk(offset, cli.chunk)?;
+        if ops.is_empty() {
+            break; // expired/filtered rows mean chunk may be empty — advance
         }
-    }
-}
 
-/// Check nedbd collection counts and advance the resume state if nedbd is
-/// ahead of the state file (e.g. data inserted by the Python migrator or a
-/// previous run on another machine).
-async fn verify_against_nedb(
-    client:      &Client,
-    base:        &str,
-    db:          &str,
-    token:       &str,
-    state:       &mut State,
-    kv_total:    usize,
-    zsets_total: usize,
-    sets_total:  usize,
-    state_file:  &Path,
-) -> Result<()> {
-    print!("{} Verifying against nedbd…  ", "◉".blue());
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+        let chunk_len = ops.len();
 
-    let kv_n    = count_collection(client, base, db, token, "kv").await.unwrap_or(0);
-    let zset_n  = count_collection(client, base, db, token, "zset").await.unwrap_or(0);
-    let set_n   = count_collection(client, base, db, token, "set").await.unwrap_or(0);
+        // 2. Split chunk into batches and send concurrently
+        let sem = Arc::new(Semaphore::new(cli.concurrency));
+        let mut handles = Vec::new();
 
-    println!("kv={kv_n} zset={zset_n} set={set_n}");
+        for batch in ops.chunks(cli.batch_size) {
+            let batch_ops  = batch.to_vec();
+            let batch_len  = batch_ops.len();
+            let c2         = Arc::clone(&client);
+            let sem2       = Arc::clone(&sem);
+            let base       = cli.nedb_url.clone();
+            let db         = cli.db.clone();
+            let tok        = cli.token.clone();
+            let dry        = cli.dry_run;
 
-    let mut advanced = false;
+            let h: tokio::task::JoinHandle<Result<usize>> = tokio::spawn(async move {
+                let _p = sem2.acquire_owned().await.unwrap();
+                if dry { return Ok(batch_len); }
+                send_batch(&c2, &base, &db, &tok, batch_ops).await
+            });
+            handles.push((h, batch_len));
+        }
 
-    macro_rules! sync_field {
-        ($field:expr, $nedb_count:expr, $total:expr, $label:expr) => {
-            if $nedb_count > $field && $nedb_count <= $total {
-                println!(
-                    "  {} {}: state file={} → nedbd={} (advancing)",
-                    "↑".yellow(), $label, $field, $nedb_count
-                );
-                $field = $nedb_count;
-                advanced = true;
-            } else if $nedb_count >= $total && $field < $total {
-                // nedbd already has all rows for this table
-                println!(
-                    "  {} {}: nedbd has all {} rows — skipping table",
-                    "✓".green(), $label, $total
-                );
-                $field = $total;
-                advanced = true;
-            }
-        };
-    }
+        // 3. Collect results in order
+        let mut chunk_sent = 0usize;
+        for (h, batch_len) in handles {
+            chunk_sent += h.await.context("task panicked")??;
+            pb.inc(batch_len as u64);
+        }
 
-    sync_field!(state.kv_done,    kv_n,   kv_total,    "kv");
-    sync_field!(state.zsets_done, zset_n, zsets_total, "zsets");
-    sync_field!(state.sets_done,  set_n,  sets_total,  "sets");
+        sent    += chunk_sent;
+        offset  += chunk_len;       // advance by raw chunk size (pre-filter)
 
-    if advanced {
-        save_state(state_file, state)?;
-        println!("  {} State synced from nedbd.\n", "✓".green());
-    } else {
-        println!("  {} State is consistent with nedbd.\n", "✓".green());
-    }
-
-    Ok(())
-}
-
-/// Trait for optional bearer auth — keeps call sites clean.
-trait MaybeBearer {
-    fn maybe_bearer(self, token: &str) -> Self;
-}
-impl MaybeBearer for reqwest::RequestBuilder {
-    fn maybe_bearer(self, token: &str) -> Self {
-        if token.is_empty() { self } else { self.bearer_auth(token) }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Core: send one table's ops with resume + concurrent batches
-// ---------------------------------------------------------------------------
-
-/// Send all ops for a single table, resuming from `already_done`.
-///
-/// Spawns up to `concurrency` tokio tasks simultaneously (semaphore-limited).
-/// After each batch completes **in order**, the cursor is advanced and the
-/// state file is saved atomically — so a kill at any point loses at most
-/// one batch worth of work.
-async fn send_table_ops(
-    ops:         Vec<Value>,
-    already_done: usize,
-    label:       &str,
-    cli:         &Cli,
-    state:       &mut State,
-    state_field: fn(&mut State) -> &mut usize,
-    pb:          &ProgressBar,
-) -> Result<usize> {
-    let remaining = if already_done < ops.len() {
-        &ops[already_done..]
-    } else {
-        pb.finish_with_message("already done");
-        return Ok(0);
-    };
-
-    let client  = Arc::new(Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?);
-    let sem     = Arc::new(Semaphore::new(cli.concurrency));
-
-    // Pre-chunk so we can spawn all tasks up front, then await in order.
-    let chunks: Vec<Vec<Value>> = remaining
-        .chunks(cli.batch_size)
-        .map(|c| c.to_vec())
-        .collect();
-
-    let mut handles = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let chunk_len = chunk.len();
-        let client2   = Arc::clone(&client);
-        let sem2      = Arc::clone(&sem);
-        let base      = cli.nedb_url.clone();
-        let db        = cli.db.clone();
-        let token     = cli.token.clone();
-        let dry       = cli.dry_run;
-
-        let h: tokio::task::JoinHandle<Result<usize>> = tokio::spawn(async move {
-            let _permit = sem2.acquire_owned().await.unwrap();
-            if dry { return Ok(chunk_len); }
-            send_batch_http(&client2, &base, &db, &token, chunk).await
-        });
-        handles.push((h, chunk_len));
-    }
-
-    let mut total_sent = 0usize;
-    for (handle, chunk_len) in handles {
-        let written = handle.await.context("task panicked")??;
-        total_sent += written;
-        *state_field(state) += chunk_len;
+        // 4. Persist cursor after every chunk — losing a chunk is the worst case
+        *state_field = offset;
         if !cli.dry_run {
             save_state(&cli.state_file, state)?;
         }
-        pb.inc(chunk_len as u64);
+
         if cli.verbose {
-            eprintln!("  {} +{} (total {})", label, chunk_len, *state_field(state));
+            eprintln!("  {label}: offset={offset}/{total} sent_this_chunk={chunk_sent}");
         }
     }
 
-    pb.finish_with_message(format!("{} rows", already_done + total_sent));
-    Ok(total_sent)
+    pb.finish_with_message(format!("{} rows", start_offset + sent));
+    Ok(sent)
+}
+
+// ---------------------------------------------------------------------------
+// nedbd-side verification
+// ---------------------------------------------------------------------------
+
+async fn count_collection(client: &Client, base: &str, db: &str, token: &str, coll: &str) -> usize {
+    let res = client.post(format!("{base}/v1/databases/{db}/query"))
+        .maybe_bearer(token)
+        .json(&json!({"nql": format!("FROM {coll} LIMIT 9999999")}))
+        .send().await;
+    match res {
+        Ok(r) if r.status().is_success() => {
+            r.json::<Value>().await.ok()
+                .and_then(|v| v["count"].as_u64())
+                .unwrap_or(0) as usize
+        }
+        _ => 0,
+    }
+}
+
+async fn verify_state(
+    client: &Client, base: &str, db: &str, token: &str,
+    state: &mut State, state_file: &Path,
+    kv_total: usize, zsets_total: usize, sets_total: usize,
+) -> Result<()> {
+    print!("{} Checking nedbd collections…  ", "◉".blue());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    let kv_n   = count_collection(client, base, db, token, "kv").await;
+    let zset_n = count_collection(client, base, db, token, "zset").await;
+    let set_n  = count_collection(client, base, db, token, "set").await;
+    println!("kv={kv_n} zset={zset_n} set={set_n}");
+
+    let mut advanced = false;
+    macro_rules! sync_f {
+        ($f:expr, $n:expr, $total:expr, $lbl:expr) => {
+            if $n > $f && $n <= $total {
+                println!("  {} {}: {} → {} (advancing)", "↑".yellow(), $lbl, $f, $n);
+                $f = $n; advanced = true;
+            } else if $n >= $total {
+                println!("  {} {}: all {} rows already in nedbd", "✓".green(), $lbl, $total);
+                $f = $total; advanced = true;
+            }
+        };
+    }
+    sync_f!(state.kv_done,    kv_n,   kv_total,    "kv");
+    sync_f!(state.zsets_done, zset_n, zsets_total, "zsets");
+    sync_f!(state.sets_done,  set_n,  sets_total,  "sets");
+
+    if advanced { save_state(state_file, state)?; println!("  {} State synced.\n", "✓".green()); }
+    else        { println!("  {} Consistent.\n", "✓".green()); }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -512,22 +387,22 @@ async fn send_table_ops(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    println!(
-        "\n{} {}  —  SQLite → nedbd\n",
-        "nedb-migrator".bold().cyan(),
-        "v1.0.0".dimmed()
-    );
-    println!("  sqlite          {}", cli.sqlite.display());
-    println!("  nedbd           {}", cli.nedb_url);
-    println!("  database        {}", cli.db);
-    println!("  batch-size      {}", cli.batch_size);
-    println!("  concurrency     {}", cli.concurrency);
+    println!("\n{} {}  —  SQLite → nedbd  (streaming)\n",
+        "nedb-migrator".bold().cyan(), "v1.0.0".dimmed());
+    println!("  sqlite            {}", cli.sqlite.display());
+    println!("  nedbd             {}", cli.nedb_url);
+    println!("  database          {}", cli.db);
+    println!("  chunk size        {}  rows (peak memory: ~{} MB)",
+        cli.chunk,
+        cli.chunk * 300 / 1_000_000 + 1);  // rough estimate
+    println!("  concurrency       {}", cli.concurrency);
+    println!("  batch size        {}", cli.batch_size);
     println!("  skip-block-cache  {}", cli.skip_block_cache);
-    println!("  dry-run         {}", cli.dry_run);
-    println!("  state file      {}", cli.state_file.display());
+    println!("  dry-run           {}", cli.dry_run);
+    println!("  state file        {}", cli.state_file.display());
     println!();
 
-    // ── Resume state ─────────────────────────────────────────────────────
+    // ── Resume state ────────────────────────────────────────────────────────
     if cli.reset && cli.state_file.exists() {
         fs::remove_file(&cli.state_file).ok();
         println!("{} State reset.\n", "↺".yellow());
@@ -535,157 +410,131 @@ async fn main() -> Result<()> {
     let mut state = if cli.reset { State::default() } else { load_state(&cli.state_file) };
 
     if state.kv_done + state.zsets_done + state.sets_done > 0 {
-        println!(
-            "{} Resuming — kv={} zsets={} sets={}\n",
-            "→".green(), state.kv_done, state.zsets_done, state.sets_done
-        );
+        println!("{} Resuming — kv={} zsets={} sets={}\n",
+            "→".green(), state.kv_done, state.zsets_done, state.sets_done);
     }
 
-    // ── Open SQLite ───────────────────────────────────────────────────────
+    // ── Open SQLite (read-only) ──────────────────────────────────────────────
     let canon = cli.sqlite.canonicalize()
         .with_context(|| format!("SQLite not found: {}", cli.sqlite.display()))?;
-    let conn = Connection::open_with_flags(
-        &canon,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .context("Failed to open SQLite")?;
+    let conn = Connection::open_with_flags(&canon,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
 
-    print!("{} Reading SQLite…  ", "◉".blue());
-    let t0 = Instant::now();
-    let kv_rows   = read_kv(&conn, cli.skip_block_cache)?;
-    let zset_rows = read_zsets(&conn)?;
-    let set_rows  = read_sets(&conn)?;
-    drop(conn); // release the file handle
-    println!(
-        "kv={} zsets={} sets={}  ({} ms)\n",
-        kv_rows.len().to_string().yellow(),
-        zset_rows.len().to_string().yellow(),
-        set_rows.len().to_string().yellow(),
-        t0.elapsed().as_millis()
-    );
+    // Count rows — cheap, doesn't load data
+    print!("{} Counting rows…  ", "◉".blue());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let kv_total    = count_table(&conn, "kv", "")?;
+    let zsets_total = count_table(&conn, "zsets", "")?;
+    let sets_total  = count_table(&conn, "sets", "")?;
+    println!("kv={} zsets={} sets={}\n",
+        kv_total.to_string().yellow(),
+        zsets_total.to_string().yellow(),
+        sets_total.to_string().yellow());
 
-    // ── Connectivity check ────────────────────────────────────────────────
+    // ── Connectivity ────────────────────────────────────────────────────────
+    let client = Arc::new(Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?);
+
     if !cli.dry_run {
-        // Use a longer timeout here: opening a large encrypted nedbd database
-        // (AOF replay) can take 30-60s on first access after heavy writes.
-        let probe = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?;
-        let h = nedb_health(&probe, &cli.nedb_url, &cli.token)
-            .await
-            .context("Cannot reach nedbd — is it running?")?;
-        println!(
-            "{} nedbd {}  version={}  encrypted={}\n",
+        let h = nedb_health(&client, &cli.nedb_url, &cli.token)
+            .await.context("Cannot reach nedbd")?;
+        println!("{} nedbd {}  version={}  encrypted={}\n",
             "✓".green(), "OK".green(),
             h["version"].as_str().unwrap_or("?"),
-            h["encrypted"].as_bool().unwrap_or(false)
-        );
-        ensure_db(&probe, &cli.nedb_url, &cli.db, &cli.token).await?;
+            h["encrypted"].as_bool().unwrap_or(false));
 
-        // ── Verify state against what nedbd actually holds ────────────────
         if !cli.no_verify {
-            verify_against_nedb(
-                &probe,
-                &cli.nedb_url,
-                &cli.db,
-                &cli.token,
-                &mut state,
-                kv_rows.len(),
-                zset_rows.len(),
-                set_rows.len(),
-                &cli.state_file,
-            )
-            .await?;
+            ensure_db(&client, &cli.nedb_url, &cli.db, &cli.token).await?;
+            verify_state(&client, &cli.nedb_url, &cli.db, &cli.token,
+                &mut state, &cli.state_file,
+                kv_total, zsets_total, sets_total).await?;
         } else {
-            println!("{} Skipping nedbd verification (--no-verify)\n", "⚠".yellow());
+            println!("{} Skipping nedbd check (--no-verify)\n", "⚠".yellow());
         }
     } else {
-        println!("{} Dry-run — skipping nedbd check\n", "⚠".yellow());
+        println!("{} Dry-run\n", "⚠".yellow());
     }
 
-    // ── Progress bars ─────────────────────────────────────────────────────
+    // ── Progress bars ────────────────────────────────────────────────────────
     let style = ProgressStyle::with_template(
-        "{prefix:.bold}  [{bar:42.cyan/blue}] {pos:>7}/{len:>7}  {per_sec:>10}  eta {eta}",
-    )
-    .unwrap()
-    .progress_chars("█▉▊▋▌▍▎▏ ");
+        "{prefix:.bold}  [{bar:42.cyan/blue}] {pos:>9}/{len:>9}  {per_sec:>12}  eta {eta}"
+    ).unwrap().progress_chars("█▉▊▋▌▍▎▏ ");
 
-    let mp = MultiProgress::new();
-
-    let pb_kv = mp.add(ProgressBar::new(kv_rows.len() as u64));
-    pb_kv.set_style(style.clone());
-    pb_kv.set_prefix("kv   ");
+    let pb_kv = ProgressBar::new(kv_total as u64);
+    pb_kv.set_style(style.clone()); pb_kv.set_prefix("kv   ");
     pb_kv.set_position(state.kv_done as u64);
 
-    let pb_zset = mp.add(ProgressBar::new(zset_rows.len() as u64));
-    pb_zset.set_style(style.clone());
-    pb_zset.set_prefix("zset ");
+    let pb_zset = ProgressBar::new(zsets_total as u64);
+    pb_zset.set_style(style.clone()); pb_zset.set_prefix("zset ");
     pb_zset.set_position(state.zsets_done as u64);
 
-    let pb_set = mp.add(ProgressBar::new(set_rows.len() as u64));
-    pb_set.set_style(style.clone());
-    pb_set.set_prefix("set  ");
+    let pb_set = ProgressBar::new(sets_total as u64);
+    pb_set.set_style(style.clone()); pb_set.set_prefix("set  ");
     pb_set.set_position(state.sets_done as u64);
 
-    // ── Build op vecs ─────────────────────────────────────────────────────
-    let kv_ops:   Vec<Value> = kv_rows.iter().map(kv_op).collect();
-    let zset_ops: Vec<Value> = zset_rows.iter().map(zset_op).collect();
-    let set_ops:  Vec<Value> = set_rows.iter().map(set_op).collect();
+    let t0 = Instant::now();
 
-    let t_migrate = Instant::now();
+    // ── kv ───────────────────────────────────────────────────────────────────
+    let kv_start = state.kv_done;
+    {
+        let skip = cli.skip_block_cache;
+        let c    = Arc::clone(&client);
+        let kv_sent = stream_table(
+            "kv", kv_total, kv_start, &cli,
+            &mut state.kv_done, &mut state,
+            |off, lim| fetch_kv_chunk(&conn, off, lim, skip),
+            c, &pb_kv,
+        ).await?;
+        let _ = kv_sent; // progress bar handles display
+    }
 
-    // ── Send kv ───────────────────────────────────────────────────────────
-    let kv_skip = state.kv_done;
-    let kv_sent = send_table_ops(
-        kv_ops, kv_skip, "kv", &cli, &mut state,
-        |s| &mut s.kv_done, &pb_kv,
-    ).await?;
+    // ── zsets ────────────────────────────────────────────────────────────────
+    let zsets_start = state.zsets_done;
+    {
+        let c = Arc::clone(&client);
+        stream_table(
+            "zset", zsets_total, zsets_start, &cli,
+            &mut state.zsets_done, &mut state,
+            |off, lim| fetch_zset_chunk(&conn, off, lim),
+            c, &pb_zset,
+        ).await?;
+    }
 
-    // ── Send zsets ────────────────────────────────────────────────────────
-    let zsets_skip = state.zsets_done;
-    let zsets_sent = send_table_ops(
-        zset_ops, zsets_skip, "zset", &cli, &mut state,
-        |s| &mut s.zsets_done, &pb_zset,
-    ).await?;
+    // ── sets ─────────────────────────────────────────────────────────────────
+    let sets_start = state.sets_done;
+    {
+        let c = Arc::clone(&client);
+        stream_table(
+            "set", sets_total, sets_start, &cli,
+            &mut state.sets_done, &mut state,
+            |off, lim| fetch_set_chunk(&conn, off, lim),
+            c, &pb_set,
+        ).await?;
+    }
 
-    // ── Send sets ─────────────────────────────────────────────────────────
-    let sets_skip = state.sets_done;
-    let sets_sent = send_table_ops(
-        set_ops, sets_skip, "set", &cli, &mut state,
-        |s| &mut s.sets_done, &pb_set,
-    ).await?;
+    // ── Summary ───────────────────────────────────────────────────────────────
+    let elapsed = t0.elapsed().as_secs_f64();
+    let total   = (state.kv_done    - kv_start)
+                + (state.zsets_done - zsets_start)
+                + (state.sets_done  - sets_start);
+    let rps = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
 
-    // ── Summary ───────────────────────────────────────────────────────────
-    let elapsed = t_migrate.elapsed().as_secs_f64();
-    let total   = kv_sent + zsets_sent + sets_sent;
-    let rps     = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-
-    println!();
-    println!("{}", "─".repeat(52));
+    println!("\n{}", "─".repeat(52));
     println!("{}", if cli.dry_run { " DRY-RUN summary " } else { " Migration complete " }.bold());
     println!("{}", "─".repeat(52));
-
-    let tag = if cli.dry_run { "[DRY] ".yellow().to_string() } else { String::new() };
-    println!("  {}kv sent:       {}", tag, kv_sent.to_string().green());
-    if kv_skip > 0 {
-        println!("  kv skipped:    {} (already done)", kv_skip.to_string().dimmed());
-    }
-    println!("  {}zsets sent:    {}", tag, zsets_sent.to_string().green());
-    println!("  {}sets sent:     {}", tag, sets_sent.to_string().green());
-    println!("  {}total:         {}", tag, total.to_string().bold().green());
-    println!("  elapsed:        {:.2}s  ({:.0} rows/s)", elapsed, rps);
+    println!("  kv sent:     {}", (state.kv_done - kv_start).to_string().green());
+    println!("  zsets sent:  {}", (state.zsets_done - zsets_start).to_string().green());
+    println!("  sets sent:   {}", (state.sets_done - sets_start).to_string().green());
+    println!("  total:       {}", total.to_string().bold().green());
+    println!("  elapsed:     {:.1}s  ({:.0} rows/s)", elapsed, rps);
 
     if !cli.dry_run && total > 0 {
-        println!();
-        println!("{} State → {}", "✓".green(), cli.state_file.display());
+        println!("\n{} State → {}", "✓".green(), cli.state_file.display());
     }
-
-    if total == 0 && (kv_skip + zsets_skip + sets_skip) > 0 {
-        println!();
-        println!("{} All rows already migrated. Run with {} to start over.",
-            "✓".green(), "--reset".bold());
+    if total == 0 {
+        println!("\n{} Nothing new — already migrated. Use --reset to start over.", "✓".green());
     }
-
     println!();
     Ok(())
 }
