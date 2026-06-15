@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     # ── SQLite (replaces Redis) ──
     SQLITE_DB_PATH: str = "../data/vision.db"
 
+    # ── NEDB (optional — when set, replaces SQLite for the KV layer) ──
+    # NEDB_URL empty = use SQLite. When set to e.g. "http://127.0.0.1:7070"
+    # the lifespan startup wires the KV layer through nedbd instead.
+    NEDB_URL: str = ""
+    NEDB_DB_NAME: str = "vision"
+    NEDBD_TOKEN: str = ""
+
     # ── Backend ──
     BACKEND_HOST: str = "0.0.0.0"
     BACKEND_PORT: int = 8080

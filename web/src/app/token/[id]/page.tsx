@@ -78,8 +78,15 @@ export default function TokenPage({ params }: { params: Promise<{ id: string }> 
         </div>
 
         <div className="card overflow-hidden">
-          <div className="px-5 py-3 border-b border-[var(--color-border)]">
+          <div className="px-5 py-3 border-b border-[var(--color-border)] flex items-center justify-between">
             <h2 className="text-sm font-semibold">Recent Activity</h2>
+            <Link
+              href={`/nedb?query=${encodeURIComponent(`FROM itsl_ops WHERE token = "${id}" TRACE caused_by`)}`}
+              className="text-xs text-[var(--color-accent)] hover:underline mono"
+              title="Open this token's causal history in the NEDB Console"
+            >
+              View in NEDB ↗
+            </Link>
           </div>
           {history.length === 0 ? (
             <div className="px-5 py-12">
