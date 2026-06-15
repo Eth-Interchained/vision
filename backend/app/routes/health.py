@@ -61,13 +61,24 @@ def health():
     except Exception:
         electrum_ok = False
 
+    # DualStore stats (nedbd primary chain)
+    dual_stats: dict = {"active": False}
+    try:
+        from ..dual_store import get_dual_store
+        ds = get_dual_store()
+        if ds is not None:
+            dual_stats = ds.stats()
+    except Exception:
+        pass
+
     overall = "ok" if (rpc_ok and db_ok) else "degraded"
     return {
-        "status": overall,
-        "rpc": rpc_ok,
-        "rpc_height": rpc_height,
-        "electrumx": electrum_ok,
-        "db": db_ok,
+        "status":         overall,
+        "rpc":            rpc_ok,
+        "rpc_height":     rpc_height,
+        "electrumx":      electrum_ok,
+        "db":             db_ok,
         "indexer_height": indexer_height,
-        "version": __version__,
+        "version":        __version__,
+        "dual_store":     dual_stats,
     }

@@ -1,12 +1,10 @@
 """dual_store.py — bi-directional, sticky dual-write store for Vision.
 
-Wraps a SQLiteStore (primary, always reliable) and a NedbStore (secondary,
-temporal, NQL-queryable). All writes go to both. Reads prefer nedbd — once a
-key exists there it sticks — and fall back to SQLite transparently.
+Wraps SQLiteStore (primary, always reliable) and NedbStore (secondary,
+temporal, NQL-queryable). All writes go to both. Reads prefer nedbd (sticky)
+and fall back to SQLite transparently on miss or nedbd unavailability.
 
-No migration required. nedbd self-populates through normal Vision operation:
-every write from the block indexer, mempool poller, and token registry flows
-into both stores simultaneously. SQLite is always the safety net.
+nedbd self-populates through normal Vision operation — no migration required.
 
 Architecture
 ------------
@@ -14,35 +12,22 @@ Architecture
     WRITE  →  SQLite (await, source of truth)
            →  nedbd  (fire-and-forget asyncio task, best-effort)
 
-    READ   →  nedbd first (sticky: if nedbd has it, always use it)
+    READ   →  nedbd first (sticky: once a key is in nedbd, always read there)
            →  SQLite fallback on miss or nedbd unavailability
 
-    DOWN   →  If nedbd is unreachable, Vision degrades gracefully to
-              SQLite-only. All reads/writes continue without interruption.
-              Background tasks drain naturally; no queue builds up.
-
-Usage
------
-
-    # main.py lifespan — replaces current init_db() call:
-    if settings.NEDB_URL:
-        sqlite = await sqlite_store.init_db()
-        nedb   = await nedb_store.init_db()
-        store  = DualStore(sqlite, nedb)
-        set_active_store(store)
-    else:
-        await sqlite_store.init_db()
-
-    # Everywhere else — no changes needed:
-    db = get_db()   # returns DualStore if nedb enabled, SQLiteStore otherwise
-    await db.get("vision:tip:height")
-    await db.set("vision:tip:height", 14501)
+Stats + Observability
+---------------------
+    DualStore.stats()           → dict with nedb_hits, sqlite_fallbacks, etc.
+    GET /api/health             → includes "dual_store" section
+    Startup log                 → prominent banner confirming DualStore is live
+    Periodic log every 1000 ops → shows % reads served by nedbd vs SQLite
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, List, Optional, Sequence, Tuple
 
 from .sqlite_store import SQLiteStore
@@ -50,60 +35,132 @@ from .nedb_store import NedbStore
 
 logger = logging.getLogger(__name__)
 
-# How many background write failures to log before suppressing (avoids log spam)
-_WARN_EVERY = 100
+# Log a stats summary every this many completed read operations
+_STATS_LOG_INTERVAL = 1_000
+
+# Log nedbd-offline warning at most once every this many seconds
+_OFFLINE_WARN_INTERVAL = 60
 
 
 class DualStore:
     """Bi-directional dual-write store — SQLite primary, nedbd secondary.
 
-    The public interface is identical to SQLiteStore so it is a drop-in
-    replacement everywhere Vision calls get_db().
+    Drop-in replacement for SQLiteStore — identical public interface.
     """
 
     def __init__(self, sqlite: SQLiteStore, nedb: NedbStore) -> None:
-        self._sq  = sqlite
-        self._nd  = nedb
-        self._fail_count = 0
+        self._sq = sqlite
+        self._nd = nedb
 
-    # ── internal helpers ─────────────────────────────────────────────────────
+        # ── Stats counters ────────────────────────────────────────────────
+        self._nedb_hits        = 0   # reads served by nedbd
+        self._sqlite_fallbacks = 0   # reads that fell back to SQLite
+        self._write_successes  = 0   # async nedbd writes that completed OK
+        self._write_failures   = 0   # async nedbd writes that failed
+        self._total_reads      = 0   # all read operations attempted
+
+        # ── State ─────────────────────────────────────────────────────────
+        self._nedb_online      = True
+        self._last_offline_log = 0.0
+        self._last_stats_log   = 0
+
+        # Startup banner
+        logger.info("=" * 58)
+        logger.info("  DualStore ACTIVE")
+        logger.info("  Reads : nedbd (sticky) → SQLite fallback")
+        logger.info("  Writes: SQLite (sync) + nedbd (fire-and-forget)")
+        logger.info("  nedbd : %s  db=%s", nedb._base_url, nedb._db)
+        logger.info("=" * 58)
+
+    # ── Public stats ─────────────────────────────────────────────────────
+
+    def stats(self) -> dict:
+        total = self._nedb_hits + self._sqlite_fallbacks
+        nedb_pct = round(self._nedb_hits / total * 100, 1) if total else 0.0
+        return {
+            "active":           True,
+            "nedb_online":      self._nedb_online,
+            "nedb_hits":        self._nedb_hits,
+            "sqlite_fallbacks": self._sqlite_fallbacks,
+            "nedb_read_pct":    nedb_pct,
+            "write_successes":  self._write_successes,
+            "write_failures":   self._write_failures,
+            "total_reads":      self._total_reads,
+        }
+
+    # ── Internal helpers ─────────────────────────────────────────────────
 
     def _fire(self, coro) -> None:
-        """Schedule a nedbd coroutine as a fire-and-forget task.
-
-        Failures are logged (rate-limited) but never propagate to the caller.
-        """
+        """Schedule a nedbd coroutine as a fire-and-forget task."""
         async def _wrap():
             try:
                 await coro
+                self._write_successes += 1
+                if not self._nedb_online:
+                    self._nedb_online = True
+                    logger.info("DualStore: nedbd reconnected — resuming dual-write")
             except Exception as e:
-                self._fail_count += 1
-                if self._fail_count % _WARN_EVERY == 1:
+                self._write_failures += 1
+                now = time.monotonic()
+                if self._nedb_online:
+                    self._nedb_online = False
                     logger.warning(
-                        "nedbd write failed (count=%d, suppressing further until next %d): %s",
-                        self._fail_count, _WARN_EVERY, e,
+                        "DualStore: nedbd write failed — running SQLite-only "
+                        "until nedbd recovers. Error: %s", e
                     )
+                    self._last_offline_log = now
+                elif now - self._last_offline_log >= _OFFLINE_WARN_INTERVAL:
+                    logger.warning(
+                        "DualStore: nedbd still unavailable "
+                        "(failures=%d, successes=%d). Error: %s",
+                        self._write_failures, self._write_successes, e,
+                    )
+                    self._last_offline_log = now
 
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_wrap())
+            asyncio.get_running_loop().create_task(_wrap())
         except RuntimeError:
-            pass  # no running loop — skip nedbd, SQLite already written
+            pass
 
-    async def _nd_get(self, coro) -> Optional[str]:
-        """Run a nedbd read, return None on any failure."""
+    async def _nd_read(self, coro) -> Optional[Any]:
+        """Run a nedbd read. Returns None on any failure (fall back to SQLite)."""
         try:
-            return await coro
+            result = await coro
+            return result
         except Exception:
             return None
 
-    # ── key / value ──────────────────────────────────────────────────────────
+    def _record_read(self, from_nedb: bool) -> None:
+        """Increment counters and periodically log read-source stats."""
+        self._total_reads += 1
+        if from_nedb:
+            self._nedb_hits += 1
+        else:
+            self._sqlite_fallbacks += 1
+
+        ops = self._nedb_hits + self._sqlite_fallbacks
+        if ops > 0 and ops % _STATS_LOG_INTERVAL == 0:
+            total = self._nedb_hits + self._sqlite_fallbacks
+            pct = round(self._nedb_hits / total * 100, 1) if total else 0.0
+            logger.info(
+                "DualStore reads: %d total — nedbd %d (%.1f%%)  "
+                "SQLite fallback %d (%.1f%%)  write_failures=%d",
+                total,
+                self._nedb_hits, pct,
+                self._sqlite_fallbacks, 100 - pct,
+                self._write_failures,
+            )
+
+    # ── key / value ──────────────────────────────────────────────────────
 
     async def get(self, key: str) -> Optional[str]:
-        val = await self._nd_get(self._nd.get(key))
+        val = await self._nd_read(self._nd.get(key))
         if val is not None:
+            self._record_read(from_nedb=True)
             return val
-        return await self._sq.get(key)
+        result = await self._sq.get(key)
+        self._record_read(from_nedb=False)
+        return result
 
     async def set(self, key: str, value: Any, ex: Optional[int] = None) -> None:
         await self._sq.set(key, value, ex)
@@ -123,7 +180,7 @@ class DualStore:
         await self._sq.expire(key, seconds)
         self._fire(self._nd.expire(key, seconds))
 
-    # ── sorted sets ──────────────────────────────────────────────────────────
+    # ── sorted sets ──────────────────────────────────────────────────────
 
     async def zadd(self, name: str, mapping: dict) -> int:
         count = await self._sq.zadd(name, mapping)
@@ -133,17 +190,20 @@ class DualStore:
     async def zrevrange(
         self, name: str, start: int, stop: int, withscores: bool = False
     ) -> list:
-        result = await self._nd_get(self._nd.zrevrange(name, start, stop, withscores))
+        result = await self._nd_read(self._nd.zrevrange(name, start, stop, withscores))
         if result is not None:
+            self._record_read(from_nedb=True)
             return result
-        return await self._sq.zrevrange(name, start, stop, withscores)
+        out = await self._sq.zrevrange(name, start, stop, withscores)
+        self._record_read(from_nedb=False)
+        return out
 
     async def zremrangebyrank(self, name: str, start: int, stop: int) -> int:
         count = await self._sq.zremrangebyrank(name, start, stop)
         self._fire(self._nd.zremrangebyrank(name, start, stop))
         return count
 
-    # ── sets ─────────────────────────────────────────────────────────────────
+    # ── sets ─────────────────────────────────────────────────────────────
 
     async def sadd(self, name: str, *members: str) -> int:
         count = await self._sq.sadd(name, *members)
@@ -151,19 +211,20 @@ class DualStore:
         return count
 
     async def smembers(self, name: str) -> set:
-        result = await self._nd_get(self._nd.smembers(name))
+        result = await self._nd_read(self._nd.smembers(name))
         if result is not None:
+            self._record_read(from_nedb=True)
             return result
-        return await self._sq.smembers(name)
+        out = await self._sq.smembers(name)
+        self._record_read(from_nedb=False)
+        return out
 
     async def srem(self, name: str, *members: str) -> int:
         count = await self._sq.srem(name, *members)
         self._fire(self._nd.srem(name, *members))
         return count
 
-    # ── domain methods — delegate entirely to SQLite ─────────────────────────
-    # These use relational joins / domain-specific tables that live only in
-    # SQLite. nedbd is not involved. All callers remain unchanged.
+    # ── domain methods — SQLite only ─────────────────────────────────────
 
     async def utxo_add_batch(self, rows: Sequence[Tuple[str, int, str, int, int]]) -> None:
         return await self._sq.utxo_add_batch(rows)
@@ -242,3 +303,16 @@ class DualStore:
 
     async def snapshot_range_exists(self, start_height: int, end_height: int) -> bool:
         return await self._sq.snapshot_range_exists(start_height, end_height)
+
+
+# ── module-level singleton reference ─────────────────────────────────────────
+
+_instance: Optional[DualStore] = None
+
+
+def get_dual_store() -> Optional[DualStore]:
+    """Return the active DualStore instance, or None if not initialised."""
+    from .sqlite_store import _store_override
+    if isinstance(_store_override, DualStore):
+        return _store_override
+    return None
