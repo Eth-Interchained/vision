@@ -1,0 +1,42 @@
+[package]
+name        = "nedb-migrator"
+version     = "1.0.0"
+edition     = "2021"
+authors     = ["Interchained LLC"]
+description = "Fast, resumable SQLite → nedbd migrator for Interchained Vision"
+license     = "MIT"
+repository  = "https://github.com/Eth-Interchained/vision"
+
+[[bin]]
+name = "nedb-migrator"
+path = "src/main.rs"
+
+[dependencies]
+# SQLite — bundled feature so no system libsqlite3 required
+rusqlite   = { version = "0.31", features = ["bundled"] }
+
+# Async HTTP — used for concurrent nedbd batch calls
+reqwest    = { version = "0.12", features = ["json"] }
+tokio      = { version = "1",    features = ["full"] }
+
+# Serialisation
+serde      = { version = "1",    features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap       = { version = "4",    features = ["derive"] }
+
+# Progress bars
+indicatif  = "0.17"
+
+# Error handling
+anyhow     = "1"
+
+# Coloured output
+colored    = "2"
+
+[profile.release]
+opt-level   = 3
+lto         = "fat"
+codegen-units = 1
+strip       = true
