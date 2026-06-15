@@ -15,7 +15,14 @@ from .indexer.main_loop import get_indexer
 from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
-from .sqlite_store import close_address_index_writer, close_db, init_address_index_writer, init_db
+from . import nedb_store
+from .dual_store import DualStore
+from .sqlite_store import (
+    close_address_index_writer, close_db,
+    init_address_index_writer, init_db,
+    get_db as _get_sqlite_db,
+    set_store_override,
+)
 from .routes import (
     addresses,
     admin_pools,
@@ -24,6 +31,7 @@ from .routes import (
     deploy,
     health,
     mempool,
+    nedb as nedb_routes,
     pool_rewards,
     rss,
     search,
@@ -65,6 +73,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("init_db failed at startup: %s", e, exc_info=True)
         raise
+
+    # Dual-write store: when NEDB_URL is set, all writes flow to both SQLite
+    # and nedbd simultaneously. Reads prefer nedbd (sticky) and fall back to
+    # SQLite. On nedbd failure, Vision degrades transparently to SQLite-only.
+    if settings.NEDB_URL:
+        try:
+            await nedb_store.init_db()
+            dual = DualStore(_get_sqlite_db(), nedb_store.get_db())
+            set_store_override(dual)
+            logger.info(
+                "DualStore active — writes to SQLite + nedbd, reads prefer nedbd "
+                "(url=%s, db=%s)", settings.NEDB_URL, settings.NEDB_DB_NAME
+            )
+        except Exception as e:
+            logger.warning(
+                "DualStore init failed (non-fatal — SQLite remains primary): %s", e
+            )
 
     indexer = get_indexer()
     address_indexer = get_address_indexer()
@@ -149,6 +174,12 @@ async def lifespan(app: FastAPI):
     await close_electrumx()
     await close_rpc()
     await close_db()
+    if settings.NEDB_URL:
+        set_store_override(None)   # restore SQLiteStore as get_db() default
+        try:
+            await nedb_store.close_db()
+        except Exception as e:
+            logger.warning("nedb_store.close_db failed: %s", e)
 
 
 app = FastAPI(
@@ -191,6 +222,7 @@ app.include_router(webhooks.router, prefix=prefix, tags=["webhooks"])
 app.include_router(admin_pools.router, prefix=prefix, tags=["admin"])
 app.include_router(pool_rewards.admin_router, prefix=prefix, tags=["admin"])
 app.include_router(pool_rewards.public_router, prefix=prefix, tags=["pools"])
+app.include_router(nedb_routes.router, prefix=prefix, tags=["nedb"])
 
 
 @app.get("/")

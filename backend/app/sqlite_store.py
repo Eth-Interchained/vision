@@ -1294,15 +1294,28 @@ async def _ensure_db() -> aiosqlite.Connection:
     return _db
 
 
-def get_db() -> SQLiteStore:
-    """Return a singleton SQLiteStore.
+_store_override = None
 
-    The underlying connection is opened lazily on the first await of any
-    method.  For startup, call ``await init_db()`` explicitly.
+
+def set_store_override(store) -> None:
+    """Replace get_db() with a custom store (e.g. DualStore).
+
+    Called by main.py when NEDB_URL is configured. All Vision code that
+    calls get_db() will receive the override without any import changes.
+    Pass None to restore the default SQLiteStore behaviour.
     """
-    # We need the connection right away, so we wrap it in a lazy proxy.
-    # However, to keep the API identical to get_redis() (sync return),
-    # we create the store around a sentinel and patch it on first use.
+    global _store_override
+    _store_override = store
+
+
+def get_db() -> SQLiteStore:
+    """Return the active store singleton.
+
+    Returns the DualStore when NEDB_URL is configured (set via
+    set_store_override), otherwise returns a lazy SQLiteStore proxy.
+    """
+    if _store_override is not None:
+        return _store_override
     return _LazyStore()
 
 
