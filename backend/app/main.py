@@ -15,6 +15,7 @@ from .indexer.main_loop import get_indexer
 from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
+from . import nedb_store
 from .sqlite_store import close_address_index_writer, close_db, init_address_index_writer, init_db
 from .indexer.nedb_backfill import (
     NedbBackfillTask, SqliteBlockSource, RpcBlockSource,
