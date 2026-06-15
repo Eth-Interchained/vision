@@ -185,16 +185,17 @@ class NedbStore:
     # ── key / value ──────────────────────────────────────────────────────
 
     async def get(self, key: str) -> Optional[str]:
-        now = time.time()
-        nql = (
-            f'FROM kv WHERE _id = "{_nql_escape(key)}" '
-            f"AND (expires_at IS NULL OR expires_at > {now}) LIMIT 1"
-        )
+        # TTL filtering done in Python, not NQL — avoids IS NULL which is
+        # not guaranteed to be supported in all NQL implementations.
+        nql = f'FROM kv WHERE _id = "{_nql_escape(key)}" LIMIT 1'
         data = await self._query(nql)
         rows = data.get("rows") or []
         if not rows:
             return None
         row = rows[0]
+        expires_at = row.get("expires_at")
+        if expires_at is not None and expires_at < time.time():
+            return None  # expired — treat as miss, SQLite fallback handles it
         v = row.get("value")
         return None if v is None else str(v)
 
