@@ -16,7 +16,13 @@ from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
 from . import nedb_store
-from .sqlite_store import close_address_index_writer, close_db, init_address_index_writer, init_db
+from .dual_store import DualStore
+from .sqlite_store import (
+    close_address_index_writer, close_db,
+    init_address_index_writer, init_db,
+    get_db as _get_sqlite_db,
+    set_store_override,
+)
 from .routes import (
     addresses,
     admin_pools,
@@ -68,16 +74,22 @@ async def lifespan(app: FastAPI):
         logger.error("init_db failed at startup: %s", e, exc_info=True)
         raise
 
-    # If NEDB is configured, also initialise its HTTP client during startup so
-    # the first request doesn't pay the connect cost. We keep SQLite alive
-    # alongside it because address/pool/snapshot operations still rely on it.
+    # Dual-write store: when NEDB_URL is set, all writes flow to both SQLite
+    # and nedbd simultaneously. Reads prefer nedbd (sticky) and fall back to
+    # SQLite. On nedbd failure, Vision degrades transparently to SQLite-only.
     if settings.NEDB_URL:
         try:
             await nedb_store.init_db()
-            logger.info("NEDB store ready (url=%s, db=%s)",
-                        settings.NEDB_URL, settings.NEDB_DB_NAME)
+            dual = DualStore(_get_sqlite_db(), nedb_store.get_db())
+            set_store_override(dual)
+            logger.info(
+                "DualStore active — writes to SQLite + nedbd, reads prefer nedbd "
+                "(url=%s, db=%s)", settings.NEDB_URL, settings.NEDB_DB_NAME
+            )
         except Exception as e:
-            logger.warning("nedb_store.init_db failed (non-fatal — SQLite remains primary): %s", e)
+            logger.warning(
+                "DualStore init failed (non-fatal — SQLite remains primary): %s", e
+            )
 
     indexer = get_indexer()
     address_indexer = get_address_indexer()
@@ -163,6 +175,7 @@ async def lifespan(app: FastAPI):
     await close_rpc()
     await close_db()
     if settings.NEDB_URL:
+        set_store_override(None)   # restore SQLiteStore as get_db() default
         try:
             await nedb_store.close_db()
         except Exception as e:
