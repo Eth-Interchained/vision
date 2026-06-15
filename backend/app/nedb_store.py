@@ -101,7 +101,15 @@ class NedbStore:
                 self._client = httpx.AsyncClient(
                     base_url=self._base_url,
                     headers=headers,
-                    timeout=30.0,
+                    # Short connect + read timeout so reads fail fast and
+                    # fall back to SQLite. httpx closes sockets cleanly on
+                    # timeout (no BrokenPipe in nedbd, unlike asyncio.wait_for).
+                    timeout=httpx.Timeout(
+                        connect=2.0,
+                        read=3.0,
+                        write=30.0,   # writes need longer — AOF fsync
+                        pool=2.0,
+                    ),
                 )
         return self._client
 
