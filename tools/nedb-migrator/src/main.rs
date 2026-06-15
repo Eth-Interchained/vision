@@ -261,23 +261,40 @@ async fn nedb_health(client: &Client, base: &str, token: &str) -> Result<Value> 
 }
 
 async fn ensure_db(client: &Client, base: &str, db: &str, token: &str) -> Result<()> {
-    let check = client
-        .get(format!("{}/v1/databases/{}", base, db))
-        .maybe_bearer(token)
-        .send()
-        .await?;
-    if check.status().is_success() {
-        return Ok(());
+    // Retry up to 3 times — first access after heavy writes can be slow
+    // while nedbd replays the AOF log for a large encrypted database.
+    let mut last_err = String::new();
+    for attempt in 1..=3u8 {
+        match client
+            .get(format!("{}/v1/databases/{}", base, db))
+            .maybe_bearer(token)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) if r.status().as_u16() == 404 => {
+                // DB doesn't exist yet — create it
+                client
+                    .post(format!("{}/v1/databases", base))
+                    .maybe_bearer(token)
+                    .json(&json!({"name": db}))
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .context("Failed to create nedbd database")?;
+                return Ok(());
+            }
+            Ok(r) => last_err = format!("HTTP {}", r.status()),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 3 {
+                    eprintln!("  ensure_db attempt {attempt}/3 failed ({last_err}), retrying…");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
     }
-    client
-        .post(format!("{}/v1/databases", base))
-        .maybe_bearer(token)
-        .json(&json!({"name": db}))
-        .send()
-        .await?
-        .error_for_status()
-        .context("Failed to create nedbd database")?;
-    Ok(())
+    anyhow::bail!("ensure_db failed after 3 attempts: {last_err}")
 }
 
 async fn send_batch_http(
@@ -549,8 +566,10 @@ async fn main() -> Result<()> {
 
     // ── Connectivity check ────────────────────────────────────────────────
     if !cli.dry_run {
+        // Use a longer timeout here: opening a large encrypted nedbd database
+        // (AOF replay) can take 30-60s on first access after heavy writes.
         let probe = Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
             .build()?;
         let h = nedb_health(&probe, &cli.nedb_url, &cli.token)
             .await
