@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""migrate_sqlite_to_nedb.py — optimized, resumable SQLite → nedbd migrator.
+"""migrate_sqlite_to_nedb.py - optimized, resumable SQLite -> nedbd migrator.
 
 Streams SQLite rows via LIMIT/OFFSET so peak memory is proportional to
 --chunk, not total rows. Sends nedbd batches concurrently (asyncio semaphore).
@@ -12,7 +12,10 @@ Usage
   # Full migration (auto-resumes if interrupted):
   python migrate_sqlite_to_nedb.py --sqlite ../data/vision.db
 
-  # Skip the ~1.2M block-cache rows — only migrate live state:
+  # Migrate into a specific nedb database name:
+  python migrate_sqlite_to_nedb.py --sqlite ../data/vision.db --db mydb
+
+  # Skip the ~1.2M block-cache rows - only migrate live state:
   python migrate_sqlite_to_nedb.py --sqlite ../data/vision.db --skip-block-cache
 
   # Dry run (counts rows, no writes):
@@ -25,9 +28,11 @@ Usage
   python migrate_sqlite_to_nedb.py --concurrency 2 --batch-size 50
 
 Environment variables (override CLI defaults):
-  NEDB_URL, NEDB_DB_NAME, NEDBD_TOKEN
+  NEDB_URL       - nedbd base URL (default: http://127.0.0.1:7070)
+  NEDB_DB_NAME   - target database name (default: vision)
+  NEDBD_TOKEN    - bearer auth token
+  SQLITE_PATH    - path to vision.db
 """
-
 from __future__ import annotations
 
 import argparse
@@ -37,7 +42,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 try:
     import aiosqlite
@@ -47,7 +52,7 @@ except ImportError:
     print("  pip install aiosqlite httpx")
     sys.exit(1)
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # State file (resume)
@@ -89,7 +94,7 @@ async def _ensure_db(client: httpx.AsyncClient, base: str, db: str) -> None:
                 return
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             if attempt < 3:
-                print(f"  ensure_db attempt {attempt}/3 failed ({e}), retrying in 5s…")
+                print(f"  ensure_db attempt {attempt}/3 failed ({e}), retrying in 5s...")
                 await asyncio.sleep(5)
             else:
                 raise
@@ -137,7 +142,7 @@ async def _send_batch(
             last_err = str(e)
 
         if attempt < 4:
-            print(f"\n  batch retry {attempt}/4 ({last_err}), waiting {delay:.1f}s…",
+            print(f"\n  batch retry {attempt}/4 ({last_err}), waiting {delay:.1f}s...",
                   flush=True)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 8.0)
@@ -146,7 +151,7 @@ async def _send_batch(
 
 
 # ---------------------------------------------------------------------------
-# Progress bar (stdlib only)
+# Progress bar (stdlib only, ASCII-safe)
 # ---------------------------------------------------------------------------
 
 class _Bar:
@@ -155,25 +160,22 @@ class _Bar:
         self.total  = max(total, 1)
         self.done   = start
         self._t0    = time.time()
-        self._drawn = 0
 
     def update(self, n: int = 0) -> None:
         self.done += n
         elapsed = max(time.time() - self._t0, 0.001)
         rate    = self.done / elapsed
-        pct     = self.done / self.total * 100
         remain  = max(self.total - self.done, 0)
         eta     = f"{remain / max(rate, 1):.0f}s" if self.done > 0 else "?"
         bar_w   = 38
         filled  = int(bar_w * self.done / self.total)
-        bar     = "█" * filled + "░" * (bar_w - filled)
+        bar     = "#" * filled + "." * (bar_w - filled)
         line    = (
             f"\r  {self.label:<6} [{bar}] "
             f"{self.done:>9,}/{self.total:>9,}  "
             f"{rate:>8,.0f}/s  eta {eta}   "
         )
         print(line, end="", flush=True)
-        self._drawn += 1
 
     def finish(self) -> None:
         self.update(0)
@@ -254,7 +256,7 @@ async def stream_table(
 
 
 # ---------------------------------------------------------------------------
-# Row → nedbd op converters
+# Row -> nedbd op converters
 # ---------------------------------------------------------------------------
 
 def _make_kv_op(skip_block_cache: bool) -> Callable:
@@ -305,7 +307,7 @@ async def _run(args: argparse.Namespace) -> int:
     base = args.nedb_url.rstrip("/")
     db   = args.db
 
-    print(f"\nnedb-migrator v{__version__}  —  SQLite → nedbd  (streaming async)\n")
+    print(f"\nnedb-migrator v{__version__}  -  SQLite -> nedbd  (streaming async)\n")
     print(f"  sqlite            {args.sqlite}")
     print(f"  nedbd             {base}")
     print(f"  database          {db}")
@@ -316,18 +318,18 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"  dry-run           {args.dry_run}")
     print(f"  state file        {args.state_file}\n")
 
-    # ── State ────────────────────────────────────────────────────────────────
+    # State
     state_file = Path(args.state_file)
     if args.reset and state_file.exists():
         state_file.unlink()
-        print("↺ State reset.\n")
+        print("State reset.\n")
 
     state = _load_state(state_file)
     if any(state.get(k, 0) for k in ("kv_done", "zsets_done", "sets_done")):
-        print(f"→ Resuming — kv={state['kv_done']:,} "
+        print(f"Resuming - kv={state['kv_done']:,} "
               f"zsets={state['zsets_done']:,} sets={state['sets_done']:,}\n")
 
-    # ── Count rows ───────────────────────────────────────────────────────────
+    # Count rows
     sqlite_path = Path(args.sqlite)
     if not sqlite_path.exists():
         print(f"ERROR: SQLite not found: {sqlite_path}")
@@ -338,9 +340,9 @@ async def _run(args: argparse.Namespace) -> int:
         async with conn.execute("SELECT COUNT(*) FROM zsets") as c: zsets_total = (await c.fetchone())[0]
         async with conn.execute("SELECT COUNT(*) FROM sets")  as c: sets_total  = (await c.fetchone())[0]
 
-    print(f"◉ Rows in SQLite — kv={kv_total:,}  zsets={zsets_total:,}  sets={sets_total:,}\n")
+    print(f"Rows in SQLite - kv={kv_total:,}  zsets={zsets_total:,}  sets={sets_total:,}\n")
 
-    # ── nedbd ────────────────────────────────────────────────────────────────
+    # nedbd
     headers: dict = {}
     if args.token:
         headers["Authorization"] = f"Bearer {args.token}"
@@ -349,7 +351,7 @@ async def _run(args: argparse.Namespace) -> int:
         if not args.dry_run:
             try:
                 h = await _nedb_health(client, base)
-                print(f"✓ nedbd OK  version={h.get('version')}  "
+                print(f"[OK] nedbd version={h.get('version')}  "
                       f"encrypted={h.get('encrypted')}\n")
             except Exception as e:
                 print(f"ERROR: Cannot reach nedbd at {base}: {e}")
@@ -357,7 +359,7 @@ async def _run(args: argparse.Namespace) -> int:
 
             if not args.no_verify:
                 await _ensure_db(client, base, db)
-                print("◉ Verifying against nedbd…", end="  ", flush=True)
+                print("Verifying against nedbd...", end="  ", flush=True)
                 kv_n   = await _count_collection(client, base, db, "kv")
                 zset_n = await _count_collection(client, base, db, "zset")
                 set_n  = await _count_collection(client, base, db, "set")
@@ -371,21 +373,21 @@ async def _run(args: argparse.Namespace) -> int:
                 ]:
                     cur = state.get(key, 0)
                     if nedb_n >= total:
-                        print(f"  ✓ {lbl}: all {total:,} rows already in nedbd")
+                        print(f"  [done] {lbl}: all {total:,} rows already in nedbd")
                         state[key] = total
                         advanced = True
                     elif nedb_n > cur:
-                        print(f"  ↑ {lbl}: state={cur:,} → nedbd={nedb_n:,} (advancing)")
+                        print(f"  [adv]  {lbl}: state={cur:,} -> nedbd={nedb_n:,} (advancing)")
                         state[key] = nedb_n
                         advanced = True
 
                 if advanced:
                     _save_state(state_file, state)
-                    print("  ✓ State synced from nedbd.\n")
+                    print("  State synced from nedbd.\n")
                 else:
-                    print("  ✓ Consistent.\n")
+                    print("  Consistent.\n")
         else:
-            print("⚠ Dry-run — skipping nedbd check\n")
+            print("DRY-RUN - skipping nedbd check\n")
 
         t0   = time.time()
         skip = args.skip_block_cache
@@ -437,9 +439,9 @@ async def _run(args: argparse.Namespace) -> int:
     total   = kv_sent + zsets_sent + sets_sent
     rps     = total / max(elapsed, 0.001)
 
-    print("\n" + "─" * 52)
+    print("\n" + "-" * 52)
     print(" Migration complete " if not args.dry_run else " DRY-RUN summary ")
-    print("─" * 52)
+    print("-" * 52)
     print(f"  kv sent:     {kv_sent:>10,}")
     if kv_start:
         print(f"  kv skipped:  {kv_start:>10,}  (already in nedbd)")
@@ -448,36 +450,53 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"  total:       {total:>10,}")
     print(f"  elapsed:     {elapsed:>9.1f}s  ({rps:,.0f} rows/s)")
     if not args.dry_run and total > 0:
-        print(f"\n✓ State → {state_file}")
+        print(f"\nState saved -> {state_file}")
     if total == 0:
-        print("\n✓ Nothing new — already migrated. Use --reset to start over.")
+        print("\nNothing new - already migrated. Use --reset to start over.")
     print()
     return 0
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Optimized, resumable SQLite → nedbd migrator (v2)",
+        description="Optimized, resumable SQLite -> nedbd migrator (v2)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--sqlite",           default=os.getenv("SQLITE_PATH", "../data/vision.db"))
-    p.add_argument("--nedb-url",         default=os.getenv("NEDB_URL", "http://127.0.0.1:7070"))
-    p.add_argument("--db",               default=os.getenv("NEDB_DB_NAME", "vision"))
-    p.add_argument("--token",            default=os.getenv("NEDBD_TOKEN", ""))
-    p.add_argument("--chunk",            type=int, default=2000,
+    p.add_argument("--sqlite",
+                   default=os.getenv("SQLITE_PATH", "../data/vision.db"),
+                   help="path to the SQLite database file")
+    p.add_argument("--nedb-url",
+                   default=os.getenv("NEDB_URL", "http://127.0.0.1:7070"),
+                   help="nedbd base URL")
+    p.add_argument("--db",
+                   default=os.getenv("NEDB_DB_NAME", "vision"),
+                   help="target nedbd database name (env: NEDB_DB_NAME)")
+    p.add_argument("--token",
+                   default=os.getenv("NEDBD_TOKEN", ""),
+                   help="bearer auth token (env: NEDBD_TOKEN)")
+    p.add_argument("--chunk",
+                   type=int, default=2000,
                    help="rows fetched from SQLite per pass (controls peak memory)")
-    p.add_argument("--concurrency",      type=int, default=4,
+    p.add_argument("--concurrency",
+                   type=int, default=4,
                    help="concurrent nedbd batch requests (lower for encrypted DBs)")
-    p.add_argument("--batch-size",       type=int, default=50,
+    p.add_argument("--batch-size",
+                   type=int, default=50,
                    help="rows per nedbd batch request")
-    p.add_argument("--skip-block-cache", action="store_true",
+    p.add_argument("--skip-block-cache",
+                   action="store_true",
                    help="skip vision:block:height:* and vision:block:hash:* rows")
-    p.add_argument("--state-file",       default=".nedb-migrator-state.json")
-    p.add_argument("--reset",            action="store_true",
+    p.add_argument("--state-file",
+                   default=".nedb-migrator-state.json",
+                   help="path to resume state file")
+    p.add_argument("--reset",
+                   action="store_true",
                    help="delete state file and start from scratch")
-    p.add_argument("--no-verify",        action="store_true",
+    p.add_argument("--no-verify",
+                   action="store_true",
                    help="skip nedbd verification pass at startup")
-    p.add_argument("--dry-run",          action="store_true",
+    p.add_argument("--dry-run",
+                   action="store_true",
                    help="count rows, print plan, no writes")
     args = p.parse_args()
     sys.exit(asyncio.run(_run(args)))
