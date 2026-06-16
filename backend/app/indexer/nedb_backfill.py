@@ -371,24 +371,9 @@ class NedbBackfillTask:
             self.highest_done = tip
             self.lowest_done  = tip
 
-        # Verify actual nedbd state — if nedbd was wiped/rebuilt, the cursor
-        # may be ahead of what nedbd actually holds. Count real blocks.
-        actual_in_nedb = await self._count_nedb_blocks()
-        if actual_in_nedb == 0 and self.blocks_written > 0:
-            logger.warning(
-                "backfill: cursor says %d written but nedbd has 0 blocks — "
-                "nedbd was wiped. Resetting cursor to tip.",
-                self.blocks_written,
-            )
-            self.lowest_done    = tip
-            self.highest_done   = tip
-            self.blocks_written = 0
-            self._write_local_cursor()
-
         logger.info(
-            "NedbBackfillTask resuming — tip=%d lowest_done=%d "
-            "already_written=%d nedb_actual=%d",
-            tip, self.lowest_done, self.blocks_written, actual_in_nedb,
+            "NedbBackfillTask resuming — tip=%d lowest_done=%d already_written=%d",
+            tip, self.lowest_done, self.blocks_written,
         )
 
         current = self.lowest_done - 1
