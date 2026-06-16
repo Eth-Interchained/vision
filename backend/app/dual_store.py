@@ -329,8 +329,13 @@ _instance: Optional[DualStore] = None
 
 
 def get_dual_store() -> Optional[DualStore]:
-    """Return the active DualStore instance, or None if not initialised."""
-    from .sqlite_store import _store_override
-    if isinstance(_store_override, DualStore):
-        return _store_override
+    """Return the active DualStore instance, or None if not initialised.
+
+    Accesses _store_override via the module object (not a cached import)
+    so it always reflects the current value set by set_store_override().
+    """
+    from . import sqlite_store as _sq_mod
+    override = _sq_mod._store_override
+    if isinstance(override, DualStore):
+        return override
     return None
