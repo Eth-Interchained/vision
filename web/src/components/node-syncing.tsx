@@ -239,6 +239,7 @@ export function NodeSyncingBanner() {
           className="rounded-full"
           style={{ width: 120, height: 120 }}
           priority
+          unoptimized
         />
       </div>
 

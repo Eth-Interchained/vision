@@ -11,6 +11,7 @@ export function Logo({ size = 28 }: { size?: number }) {
         className="rounded-full"
         style={{ width: size, height: size }}
         priority
+        unoptimized
       />
       <div className="leading-tight">
         <div className="text-sm font-semibold tracking-tight">Interchained</div>
