@@ -23,10 +23,9 @@ from .sqlite_store import (
     get_db as _get_sqlite_db,
     set_store_override,
 )
-from .indexer.nedb_backfill import (
-    NedbBackfillTask, SqliteBlockSource, RpcBlockSource,
-    get_backfill_task, set_backfill_task,
-)
+# NedbBackfillTask retired — DualStore handles NEDB sync in real-time.
+# Import kept for backwards compat but nothing is started at runtime.
+from .indexer.nedb_backfill import get_backfill_task
 from .routes import (
     addresses,
     admin_pools,
@@ -165,32 +164,14 @@ async def lifespan(app: FastAPI):
 
     _background_tasks.append(asyncio.create_task(webhooks.webhook_dispatcher_loop()))
 
-    # ── NEDB bi-directional backfill (tip → genesis) ──────────────────────
-    # Runs only when NEDB_URL is configured. Uses SQLite cache as primary
-    # source (fast, no RPC), falls back to live RPC for missing blocks.
+    # ── NEDB sync: handled by DualStore ───────────────────────────────────
+    # NedbBackfillTask (tip→genesis historical backfill) is retired.
+    # All new blocks are written to nedbd in real-time via DualStore as they
+    # arrive from the indexer. Historical data is migrated separately via
+    # migrate_sqlite_to_nedb.py (one-time run against the SQLite KV store).
+    # No background loop needed — DualStore is the authoritative write path.
     if settings.NEDB_URL:
-        try:
-            from .sqlite_store import get_db as _get_db
-            from .rpc.client import get_rpc as _get_rpc
-            # init_db() is idempotent — returns the cached NedbStore singleton
-            # (not the _LazyStore proxy, which lacks _put/_query internals)
-            _nd_store = await nedb_store.init_db()
-            _backfill = NedbBackfillTask(
-                nedb=_nd_store,
-                db=settings.NEDB_DB_NAME,
-                sources=[
-                    SqliteBlockSource(_get_db()),
-                    RpcBlockSource(_get_rpc()),
-                ],
-                batch_size=500,
-                sleep_ms=100,
-                collection="blocks",
-            )
-            set_backfill_task(_backfill)
-            await _backfill.start()
-            logger.info("NedbBackfillTask started (tip→genesis + forward sync)")
-        except Exception as e:
-            logger.warning("NedbBackfillTask failed to start (non-fatal): %s", e)
+        logger.info("NEDB sync active via DualStore (real-time, no backfill loop)")
 
     yield
 
@@ -198,10 +179,7 @@ async def lifespan(app: FastAPI):
     for t in _background_tasks:
         t.cancel()
 
-    # Stop backfill gracefully
-    _bt = get_backfill_task()
-    if _bt:
-        await _bt.stop()
+    # (NedbBackfillTask retired — DualStore handles sync)
 
     await indexer.stop()
     await address_indexer.stop()
