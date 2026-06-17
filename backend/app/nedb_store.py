@@ -204,6 +204,14 @@ class NedbStore:
                 f"/v1/databases/{self._db}/put",
                 json=payload,
             )
+        if resp.status_code == 503:
+            # nedbd startup cold scan in progress — reads available, writes retry later.
+            # DualStore is fire-and-forget; SQLite already has this write. Non-fatal.
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "nedbd write 503 (startup scan in progress) — SQLite is primary, will retry"
+            )
+            return {}
         resp.raise_for_status()
         return resp.json()
 
